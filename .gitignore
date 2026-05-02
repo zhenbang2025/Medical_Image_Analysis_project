@@ -1,0 +1,17 @@
+# Dataset
+chest_xray/
+embeddings/
+
+# Outputs
+output/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
