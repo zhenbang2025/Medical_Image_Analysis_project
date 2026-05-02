@@ -1,5 +1,5 @@
 """
-Extract image embeddings from Chest X-Ray dataset using Qwen2.5-VL.
+Extract image embeddings from Chest X-Ray dataset using Qwen2-VL.
 
 Saves pooled embeddings + labels to .pt files for offline MLP training.
 
@@ -20,7 +20,8 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 
 # Fixed text prompt paired with each image
@@ -87,9 +88,8 @@ def extract_embeddings(model, processor, images, device):
     inputs = inputs.to(device)
 
     with torch.no_grad():
-        outputs = model(**inputs)
-        # Get the last hidden state and mean-pool over all tokens
-        hidden_states = outputs.last_hidden_state  # (B, seq_len, hidden_dim)
+        outputs = model(**inputs, output_hidden_states=True)
+        hidden_states = outputs.hidden_states[-1]  # (B, seq_len, hidden_dim)
         embeddings = hidden_states.mean(dim=1)     # (B, hidden_dim)
 
     return embeddings.cpu()
@@ -100,16 +100,23 @@ def main():
     parser.add_argument(
         "--dataset_dir",
         type=str,
-        default="./chest_xray/chest_xray",
+        default="./data/chest_xray_small",
         help="Path to the chest_xray subdirectory containing train/test/val",
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen2.5-VL-2B-Instruct",
-        help="HuggingFace model name or local path",
+        default="./models/Qwen2-VL-2B-Instruct",
+        help="Path to local model directory or HuggingFace model name",
     )
     parser.add_argument("--batch_size", type=int, default=4, help="Images per batch")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "mps", "cuda", "cpu"],
+        help="Device to use: auto (prefer mps/cuda), or force cpu",
+    )
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -119,10 +126,20 @@ def main():
     args = parser.parse_args()
 
     # Device setup — Mac MPS preferred, fallback to CPU
-    if torch.backends.mps.is_available():
+    if args.device == "auto":
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+            dtype = torch.float16
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+            dtype = torch.float16
+        else:
+            device = torch.device("cpu")
+            dtype = torch.float32
+    elif args.device == "mps":
         device = torch.device("mps")
         dtype = torch.float16
-    elif torch.cuda.is_available():
+    elif args.device == "cuda":
         device = torch.device("cuda")
         dtype = torch.float16
     else:
@@ -133,11 +150,18 @@ def main():
 
     # Load model and processor
     print(f"Loading model: {args.model} ...")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-        device_map="auto",
-    )
+    if device.type == "cpu":
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            args.model,
+            torch_dtype=dtype,
+            device_map="cpu",
+        )
+    else:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            args.model,
+            torch_dtype=dtype,
+            device_map="auto",
+        )
     processor = AutoProcessor.from_pretrained(args.model)
     print(f"Model loaded. Parameters: {sum(p.numel() for p in model.parameters()):,}")
 

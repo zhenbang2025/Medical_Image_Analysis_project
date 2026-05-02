@@ -1,0 +1,8 @@
+{
+  "mlp_test_accuracy": 1.0,
+  "mlp_best_val_accuracy": 1.0,
+  "epochs": 30,
+  "lr": 0.001,
+  "hidden_dim": 256,
+  "dropout": 0.3
+}

@@ -1,5 +1,5 @@
 """
-Train an MLP classifier on pre-extracted Qwen2.5-VL image embeddings.
+Train an MLP classifier on pre-extracted Qwen2-VL image embeddings.
 
 Usage:
     python train_classifier.py [--epochs 30] [--lr 1e-3] [--batch_size 64]
@@ -17,6 +17,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 class EmbeddingDataset(Dataset):
@@ -92,6 +95,31 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, correct / total
 
 
+def plot_history(history, output_dir):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+    ax1.plot(epochs, history["train_loss"], "b-", label="Train")
+    ax1.plot(epochs, history["val_loss"], "r-", label="Val")
+    ax1.set_title("Loss")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.legend()
+
+    ax2.plot(epochs, history["train_acc"], "b-", label="Train")
+    ax2.plot(epochs, history["val_acc"], "r-", label="Val")
+    ax2.set_title("Accuracy")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Accuracy")
+    ax2.legend()
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, "training_curves.png")
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"Training curves saved to {save_path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -151,11 +179,17 @@ def main():
 
     best_val_acc = 0
     best_model_state = None
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         scheduler.step()
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
 
         print(
             f"Epoch {epoch:03d} | "
@@ -204,6 +238,9 @@ def main():
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
+    # Plot training curves
+    plot_history(history, args.output_dir)
+
     # Try to load zero-shot results for comparison
     zero_shot_path = os.path.join(args.output_dir, "zero_shot_results.json")
     if os.path.exists(zero_shot_path):
@@ -216,10 +253,10 @@ def main():
         print("\n" + "=" * 60)
         print("COMPARISON: Zero-shot vs MLP (Test Set)")
         print("=" * 60)
-        print(f"  Zero-shot (Qwen2.5-VL only):  {zs_acc:.4f}")
-        print(f"  Qwen embeddings + MLP:        {mlp_acc:.4f}")
+        print(f"  Zero-shot (Qwen2-VL only):  {zs_acc:.4f}")
+        print(f"  Qwen embeddings + MLP:      {mlp_acc:.4f}")
         improvement = mlp_acc - zs_acc
-        print(f"  Improvement:                  {improvement:+.4f}")
+        print(f"  Improvement:                {improvement:+.4f}")
         if improvement > 0:
             print(f"  MLP correctly classifies {improvement * 100:.1f}% more test samples.")
         else:

@@ -1,5 +1,5 @@
 """
-Zero-shot classification using Qwen2.5-VL directly (no MLP).
+Zero-shot classification using Qwen2-VL directly (no MLP).
 
 Asks the model to classify each image as NORMAL or PNEUMONIA,
 then computes accuracy for comparison with the trained MLP.
@@ -16,7 +16,9 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+import os
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 
 PROMPT_ZERO_SHOT = (
@@ -29,7 +31,7 @@ PROMPT_ZERO_SHOT = (
 class ChestXRayDataset(Dataset):
     def __init__(self, root_dir, split="test"):
         self.split = split
-        self.root_dir = Path(root_dir)
+        self.root_dir = Path(root_dir) / split
         self.samples = []
         self.labels = []
 
@@ -169,16 +171,24 @@ def main():
     parser.add_argument(
         "--dataset_dir",
         type=str,
-        default="./chest_xray/chest_xray",
+        default=""
+        "data/chest_xray_small",
         help="Path to the chest_xray subdirectory",
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="Qwen/Qwen2.5-VL-2B-Instruct",
-        help="HuggingFace model name or local path",
+        default="models/Qwen2-VL-2B-Instruct",
+        help="Path to local model directory or HuggingFace model name",
     )
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "mps", "cuda", "cpu"],
+        help="Device to use: auto (prefer mps/cuda), or force cpu",
+    )
     parser.add_argument(
         "--split",
         type=str,
@@ -188,10 +198,20 @@ def main():
     )
     args = parser.parse_args()
 
-    if torch.backends.mps.is_available():
+    if args.device == "auto":
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+            dtype = torch.float16
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+            dtype = torch.float16
+        else:
+            device = torch.device("cpu")
+            dtype = torch.float32
+    elif args.device == "mps":
         device = torch.device("mps")
         dtype = torch.float16
-    elif torch.cuda.is_available():
+    elif args.device == "cuda":
         device = torch.device("cuda")
         dtype = torch.float16
     else:
@@ -200,11 +220,18 @@ def main():
 
     print(f"Device: {device}, dtype: {dtype}")
     print(f"Loading model: {args.model} ...")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-        device_map="auto",
-    )
+    if device.type == "cpu":
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            args.model,
+            torch_dtype=dtype,
+            device_map="cpu",
+        )
+    else:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            args.model,
+            torch_dtype=dtype,
+            device_map="auto",
+        )
     processor = AutoProcessor.from_pretrained(args.model)
 
     splits = ["train", "val", "test"] if args.split == "all" else [args.split]
@@ -213,7 +240,7 @@ def main():
     for split in splits:
         dataset = ChestXRayDataset(args.dataset_dir, split=split)
         if len(dataset) == 0:
-            print(f"  No images found for split '{split}', skipping.")
+            print(f"  No images found for split '{split}' in {args.dataset_dir}, skipping.")
             continue
 
         loader = DataLoader(

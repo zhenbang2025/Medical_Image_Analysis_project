@@ -1,9 +1,10 @@
 # Dataset
-chest_xray/
-embeddings/
+data/chest_xray/
+data/__MACOSX/
+# embeddings/
 
 # Outputs
-output/
+# output/
 
 # Python
 __pycache__/
@@ -15,3 +16,8 @@ __pycache__/
 
 # OS
 .DS_Store
+
+#model
+models/
+
+CLAUDE.md
