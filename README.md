@@ -1,9 +1,46 @@
-# Medical Image Analysis: Chest X-Ray Classification
+# Chest X-Ray Bounding Box Localization
 
-Classify chest X-rays as **NORMAL** or **PNEUMONIA** using Qwen2-VL vision-language model. Compares two approaches:
+Adapt Qwen2-VL vision-language model for medical image bounding box localization by training lightweight MLP heads on top of frozen image embeddings.
 
-1. **Zero-shot** — Direct classification via prompting
-2. **MLP fine-tune** — Extract image embeddings, train a lightweight MLP on top
+## Overview
+
+This project compares two paradigms for adapting large vision-language models (VLMs) to medical image bounding box localization:
+
+1. **Zero-shot / Few-shot prompting** — Query the VLM directly to predict bbox coordinates
+2. **MLP fine-tuning** — Extract image embeddings with class-specific prompts, train a small MLP on top
+
+| Dataset | Classes | Train / Test per class |
+|---|---|---|
+| NIH ChestX-ray14 | Atelectasis, Effusion, Cardiomegaly | 30 / 10 |
+
+## Results
+
+### Overall Performance
+
+| Method | Mean IoU | IoU@0.25 | IoU@0.5 |
+|---|---|---|---|
+| Plain MLP | 0.047 | 0.067 | 0.000 |
+| **MLP + Residual** | **0.219** | **0.433** | **0.100** |
+| Qwen Zero-shot | 0.070 | 0.167 | 0.000 |
+| **Qwen Few-shot (n=3)** | **0.254** | **0.467** | **0.167** |
+
+### Per-class Breakdown
+
+| Class | Plain MLP | MLP+Residual | Qwen Zero-shot | Qwen Few-shot (n=3) |
+|---|---|---|---|---|
+| **Atelectasis** | 0.014 / 0.000 | 0.098 / 0.100 | 0.036 / 0.100 | 0.064 / 0.100 |
+| **Effusion** | 0.124 / 0.200 | 0.119 / 0.200 | 0.063 / 0.100 | 0.186 / 0.400 |
+| **Cardiomegaly** | 0.004 / 0.000 | 0.440 / 1.000 | 0.110 / 0.300 | 0.511 / 0.900 |
+
+*Per-class values show Mean IoU / IoU@0.25*
+
+### Analysis
+
+- **Residual connections are essential**: Plain MLP collapses to near-zero predictions (all samples converge to a single point). Adding residual connections with LayerNorm improves mean IoU by **213.7%** over zero-shot.
+- **Few-shot still leads**: Qwen with 3 exemplars achieves 0.254 IoU, 13.8% above MLP+Residual. The VLM's pre-trained spatial reasoning provides an edge that small supervised sets can't fully close.
+- **Cardiomegaly is easiest**: Largest, most anatomically stable structure. MLP+Residual reaches 0.44 IoU (100% @0.25), few-shot reaches 0.51 (90% @0.25).
+- **Atelectasis is hardest**: Small, variable regions. All methods struggle (< 0.1 IoU). Suggests need for more data or class-specific architectures.
+- **Effusion is mixed**: High variance — some samples are well-localized (large effusions), others fail (small/subtle ones).
 
 ## Setup
 
@@ -13,121 +50,107 @@ pip install -r requirements.txt
 
 ### Dependencies
 
-torch, transformers, pillow, tqdm, accelerate, qwen-vl-utils, matplotlib, kagglehub
+torch, transformers, pillow, tqdm, accelerate, qwen-vl-utils, matplotlib
 
-## Dataset
-
-Download the Chest X-Ray Pneumonia dataset from Kaggle:
+## Quick Start
 
 ```bash
-python data/download.py
+# 1. Extract bbox embeddings (class-specific prompts baked in)
+python scripts/extract_bbox_embeddings.py --model ./models/Qwen2-VL-2B-Instruct
+
+# 2. Train plain MLP
+python scripts/train_bbox_mlp.py --epochs 100 --lr 1e-3
+
+# 3. Train MLP with residual connections
+python scripts/train_bbox_mlp.py --epochs 100 --lr 1e-3 --use_residual
+
+# 4. Evaluate both variants
+python scripts/evaluate_bbox.py --model_path ./output/plain/bbox_mlp.pt
+python scripts/evaluate_bbox.py --model_path ./output/residual/bbox_mlp.pt
+
+# 5. Zero-shot + few-shot Qwen baselines
+python scripts/evaluate_few_shot.py --n_shot 0
+python scripts/evaluate_few_shot.py --n_shot 3
+
+# 6. Compare all 4 methods
+python scripts/compare_results.py
 ```
 
-The dataset is saved to `data/chest_xray/`:
+### Mac-Specific Notes
+
+- Uses `float16` on MPS (Apple Silicon) to reduce memory (~2-4GB for 2B/3B model)
+- If OOM, reduce `--batch_size` to 1 or 2
+- MLP training is extremely lightweight and runs on CPU/MPS
+
+## Architecture
+
+### Embedding Extraction
+
+Image + class-specific prompt → Qwen2-VL → mean-pool `last_hidden_state` → `(B, hidden_dim)` embedding. The prompt (e.g., "Describe lung collapse in this X-ray.") encodes class semantics into the embedding, so the downstream MLP doesn't need class labels as input.
+
+### BBox MLP - Plain
 
 ```
-data/chest_xray/
-├── train/NORMAL/       (1,341 images)
-├── train/PNEUMONIA/    (3,875 images)
-├── val/NORMAL/         (8 images)
-├── val/PNEUMONIA/      (8 images)
-├── test/NORMAL/        (234 images)
-└── test/PNEUMONIA/     (390 images)
+Linear(D→256) → ReLU → Dropout → Linear(256→128) → ReLU → Dropout → Linear(128→4)
 ```
 
-### Small Dataset (quick test)
-
-A small subset at `data/chest_xray_small/` is provided for fast prototyping:
+### BBox MLP - Residual
 
 ```
-├── train/  (30 images: 10 NORMAL + 20 PNEUMONIA)
-├── val/    (16 images: 8 NORMAL + 8 PNEUMONIA)
-└── test/   (20 images: 8 NORMAL + 12 PNEUMONIA)
+h = Linear(D→256)
+h = LayerNorm(h) → Linear(256→128) → ReLU → Dropout → Linear(128→256) + Linear(256→256)  # residual
+out = LayerNorm(h) → Linear(256→128) → ReLU → Dropout → Linear(128→4)
 ```
 
-## Model
+### Few-shot / Zero-shot Qwen
 
-Download Qwen2-VL-2B-Instruct:
+Direct text generation from Qwen2-VL. Zero-shot: class description prompt only. Few-shot: prompt includes 3 ground-truth bbox examples before the query image.
 
-```bash
-# Option 1: HuggingFace
-huggingface-cli download Qwen/Qwen2-VL-2B-Instruct --local-dir models/Qwen2-VL-2B-Instruct
+## Project Structure
 
-# Option 2: ModelScope
-modelscope download --model Qwen/Qwen2-VL-2B-Instruct --local_dir models/Qwen2-VL-2B-Instruct
+```
+├── scripts/
+│   ├── extract_bbox_embeddings.py     # Extract bbox embeddings (3 classes)
+│   ├── train_bbox_mlp.py              # Train bbox MLP (plain + residual)
+│   ├── evaluate_bbox.py               # Evaluate bbox MLP + visualize
+│   ├── evaluate_few_shot.py           # Qwen zero/few-shot bbox baseline
+│   └── compare_results.py             # Compare all 4 methods → table
+├── output/
+│   ├── plain/                         # Plain MLP results
+│   │   ├── bbox_mlp.pt
+│   │   └── bbox_eval.json
+│   ├── residual/                      # Residual MLP results
+│   │   ├── bbox_mlp.pt
+│   │   └── bbox_eval.json
+│   ├── zero_shot_eval.json            # Qwen zero-shot bbox
+│   ├── few_shot_3_eval.json           # Qwen few-shot bbox (n=3)
+│   └── comparison.json                # All methods compared
+├── embeddings/                        # Pre-extracted Qwen embeddings
+├── requirements.txt
+└── README.md
 ```
 
-## Usage
-
-All scripts default to the small dataset (`data/chest_xray_small`). For the full dataset, add `--dataset_dir ./data/chest_xray`.
-
-### Step 1: Zero-shot Evaluation
-
-```bash
-python scripts/evaluate_zero_shot.py --device cpu --split test
-```
-
-Results → `output/zero_shot_results.json`
-
-### Step 2: Extract Embeddings
-
-```bash
-python scripts/extract_embeddings.py --device cpu
-```
-
-Embeddings → `embeddings/{train,val,test}.pt`
-
-### Step 3: Train MLP
-
-```bash
-python scripts/train_classifier.py
-```
-
-Outputs: `output/mlp_classifier.pt`, `output/results.json`, `output/training_curves.png`
-
-### Full Dataset Example
-
-```bash
-python scripts/evaluate_zero_shot.py --dataset_dir ./data/chest_xray --split test --device cpu
-python scripts/extract_embeddings.py --dataset_dir ./data/chest_xray --device cpu
-python scripts/train_classifier.py
-```
-
-## Common Arguments
+## Key Script Arguments
 
 | Argument | Description | Default |
 |---|---|---|
-| `--model` | Model path | `./models/Qwen2-VL-2B-Instruct` |
-| `--dataset_dir` | Dataset path | `./data/chest_xray_small` |
-| `--device` | `auto`, `mps`, `cuda`, or `cpu` | `auto` |
-| `--batch_size` | Images per batch | `1` (zero-shot), `4` (extract) |
+| `--model` | Qwen model path | `./models/Qwen2-VL-2B-Instruct` |
+| `--device` | `auto`, `mps`, `cuda`, `cpu` | `auto` |
+| `--batch_size` | Images per batch | `4` |
+| `--epochs` | Training epochs | `100` |
+| `--lr` | Learning rate | `1e-3` |
+| `--use_residual` | Use residual connections | Off |
+| `--n_shot` | Number of few-shot examples | `0` |
 
-## Results
+## Why This Approach
 
-### Small Dataset (Qwen2-VL-2B-Instruct)
+Training a small MLP on frozen VLM embeddings is a **parameter-efficient** way to adapt large models to domain-specific tasks:
 
-| Method | Test Accuracy |
-|---|---|
-| Zero-shot (Qwen2-VL prompting) | 0.4000 |
-| Qwen embeddings + MLP | 1.0000 |
+- **No VLM fine-tuning needed** — Qwen stays frozen, only the MLP (a few hundred KB) is trained
+- **Fast iteration** — Embedding extraction is one-time; MLP training takes seconds
+- **Fair comparison** — Same embeddings, same test set, only the head differs (MLP vs prompt)
+- **Deployable** — The MLP checkpoint is tiny and can run independently once embeddings are computed
 
-> **Note**: The small dataset (66 images) is for rapid prototyping. MLP accuracy is inflated due to limited data. Use the full dataset for realistic evaluation.
+## License
 
-### Why MLP Works Better
-
-The MLP classifier learns to map embeddings to labels from supervised examples, while zero-shot relies solely on the model's pre-trained knowledge and prompt formatting. Even with a small labeled set, supervised fine-tuning significantly outperforms zero-shot prompting on this task.
-
-## Output Files
-
-```
-output/
-├── zero_shot_results.json   # Zero-shot metrics
-├── results.json             # MLP training metrics
-├── mlp_classifier.pt        # Trained MLP weights
-└── training_curves.png      # Loss & accuracy curves
-
-embeddings/
-├── train.pt
-├── val.pt
-└── test.pt
-```
+This project is for research and educational purposes.

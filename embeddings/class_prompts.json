@@ -1,0 +1,5 @@
+{
+  "Atelectasis": "Describe lung collapse in this X-ray.",
+  "Effusion": "Describe pleural effusion in this X-ray.",
+  "Cardiomegaly": "Describe heart enlargement in this X-ray."
+}

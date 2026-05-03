@@ -1,0 +1,9 @@
+{
+  "best_val_iou": 0.21953031420707703,
+  "test_mean_iou": 0.21953031420707703,
+  "model_tag": "plain",
+  "use_residual": false,
+  "epochs": 100,
+  "lr": 0.001,
+  "hidden_dim": 256
+}

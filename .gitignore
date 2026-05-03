@@ -1,6 +1,8 @@
 # Dataset
 data/chest_xray/
 data/__MACOSX/
+data/3/
+data/nih-chest-xrays/
 # embeddings/
 
 # Outputs

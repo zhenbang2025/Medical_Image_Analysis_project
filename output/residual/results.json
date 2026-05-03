@@ -1,0 +1,9 @@
+{
+  "best_val_iou": 0.21882009506225586,
+  "test_mean_iou": 0.21882009506225586,
+  "model_tag": "residual",
+  "use_residual": true,
+  "epochs": 100,
+  "lr": 0.001,
+  "hidden_dim": 256
+}

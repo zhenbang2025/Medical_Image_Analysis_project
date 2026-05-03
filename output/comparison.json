@@ -1,0 +1,48 @@
+{
+  "methods": [
+    "MLP",
+    "MLP+Residual",
+    "Qwen Zero-shot",
+    "Qwen Few-shot (n=3)"
+  ],
+  "overall": {
+    "mean_iou": {
+      "MLP": 0.04735419899225235,
+      "MLP+Residual": 0.21882009506225586,
+      "Qwen Zero-shot": 0.06974590744148676,
+      "Qwen Few-shot (n=3)": 0.2539232202999
+    },
+    "iou_at_0.25": {
+      "MLP": 0.06666667014360428,
+      "MLP+Residual": 0.4333333373069763,
+      "Qwen Zero-shot": 0.16666666666666666,
+      "Qwen Few-shot (n=3)": 0.4666666666666667
+    },
+    "iou_at_0.5": {
+      "MLP": 0.0,
+      "MLP+Residual": 0.10000000149011612,
+      "Qwen Zero-shot": 0.0,
+      "Qwen Few-shot (n=3)": 0.16666666666666666
+    }
+  },
+  "per_class": {
+    "Atelectasis": {
+      "MLP": 0.013774462044239044,
+      "MLP+Residual": 0.09784267097711563,
+      "Qwen Zero-shot": 0.03615543216764987,
+      "Qwen Few-shot (n=3)": 0.06381975855651466
+    },
+    "Effusion": {
+      "MLP": 0.12381686270236969,
+      "MLP+Residual": 0.11897137016057968,
+      "Qwen Zero-shot": 0.06312981483055365,
+      "Qwen Few-shot (n=3)": 0.18646397569872014
+    },
+    "Cardiomegaly": {
+      "MLP": 0.00447127316147089,
+      "MLP+Residual": 0.43964624404907227,
+      "Qwen Zero-shot": 0.10995247532625678,
+      "Qwen Few-shot (n=3)": 0.5114859266444651
+    }
+  }
+}

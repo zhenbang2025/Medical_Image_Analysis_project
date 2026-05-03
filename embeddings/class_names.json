@@ -1,0 +1,12 @@
+{
+  "classes": [
+    "Atelectasis",
+    "Effusion",
+    "Cardiomegaly"
+  ],
+  "class2idx": {
+    "Atelectasis": 0,
+    "Effusion": 1,
+    "Cardiomegaly": 2
+  }
+}
