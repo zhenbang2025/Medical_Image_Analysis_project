@@ -10,15 +10,16 @@ Usage:
 
 import argparse
 import json
-import re
-import torch
-from pathlib import Path
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
 import os
+from typing import List
+
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
+
+from data_utils import ImageDataset, load_split_file, list_split_samples
+from metrics_utils import compute_metrics
 
 
 PROMPT_ZERO_SHOT = (
@@ -28,38 +29,15 @@ PROMPT_ZERO_SHOT = (
 )
 
 
-class ChestXRayDataset(Dataset):
-    def __init__(self, root_dir, split="test"):
-        self.split = split
-        self.root_dir = Path(root_dir) / split
-        self.samples = []
-        self.labels = []
-
-        for label_idx, class_name in enumerate(["NORMAL", "PNEUMONIA"]):
-            class_dir = self.root_dir / class_name
-            if not class_dir.exists():
-                class_dir = self.root_dir / "chest_xray" / class_name
-            for img_path in sorted(class_dir.glob("*.jpeg")):
-                self.samples.append(str(img_path))
-                self.labels.append(label_idx)
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img = Image.open(self.samples[idx]).convert("RGB")
-        return img, self.samples[idx], self.labels[idx]
-
-
 def collate_fn(batch):
     images = [item[0] for item in batch]
-    paths = [item[1] for item in batch]
-    labels = [item[2] for item in batch]
+    labels = [item[1] for item in batch]
+    paths = [item[2] for item in batch]
     return images, paths, labels
 
 
-def classify_batch(model, processor, images, device):
-    """Ask Qwen to classify images and parse responses."""
+def classify_batch_generate(model, processor, images, device):
+    """Ask Qwen to classify images and parse responses (generation mode)."""
     texts = [PROMPT_ZERO_SHOT] * len(images)
     messages = []
     for text in texts:
@@ -101,7 +79,7 @@ def classify_batch(model, processor, images, device):
     return responses
 
 
-def parse_response(response):
+def parse_response(response: str):
     """Extract NORMAL or PNEUMONIA from the model's response."""
     text = response.strip().upper()
     if "PNEUMONIA" in text:
@@ -111,59 +89,113 @@ def parse_response(response):
     return None  # Could not parse
 
 
-def evaluate_split(model, processor, loader, device, split_name):
-    """Evaluate zero-shot accuracy on a dataset split."""
-    all_preds = []
+def score_candidates(
+    model,
+    processor,
+    images,
+    candidates: List[str],
+    device,
+    length_norm: str,
+):
+    """Score candidate answers by log-likelihood."""
+    messages = [
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": PROMPT_ZERO_SHOT},
+                ],
+            }
+        ]
+        for _ in images
+    ]
+
+    prompt_text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_inputs = processor(
+        text=prompt_text, images=images, padding=True, return_tensors="pt"
+    ).to(device)
+
+    prompt_len = prompt_inputs.input_ids.shape[1]
+
+    scores = []
+    for candidate in candidates:
+        candidate_ids = processor.tokenizer(
+            candidate, add_special_tokens=False, return_tensors="pt"
+        ).input_ids.to(device)
+        candidate_len = candidate_ids.shape[1]
+
+        expanded_candidate = candidate_ids.expand(prompt_inputs.input_ids.size(0), -1)
+        input_ids = torch.cat([prompt_inputs.input_ids, expanded_candidate], dim=1)
+        attention_mask = torch.cat(
+            [
+                prompt_inputs.attention_mask,
+                torch.ones_like(expanded_candidate, device=device),
+            ],
+            dim=1,
+        )
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+
+        start = prompt_len - 1
+        end = start + candidate_len
+        candidate_logits = logits[:, start:end, :]
+        log_probs = torch.log_softmax(candidate_logits, dim=-1)
+        token_log_probs = log_probs.gather(
+            -1, expanded_candidate.unsqueeze(-1)
+        ).squeeze(-1)
+
+        if length_norm == "avg":
+            score = token_log_probs.mean(dim=1)
+        else:
+            score = token_log_probs.sum(dim=1)
+
+        scores.append(score)
+
+    stacked = torch.stack(scores, dim=1)
+    probs = torch.softmax(stacked, dim=1)
+    return probs
+
+
+def evaluate_split(model, processor, loader, device, split_name, scoring, length_norm):
+    """Evaluate zero-shot performance on a dataset split."""
+    all_probs = []
     all_labels = []
     all_responses = []
     all_paths = []
-    parsed_count = 0
 
     print(f"\n[{split_name}] Running zero-shot classification...")
     for images, paths, labels in tqdm(loader, desc=split_name):
-        responses = classify_batch(model, processor, images, device)
-
-        for resp, path, label in zip(responses, paths, labels):
-            pred = parse_response(resp)
-            all_responses.append(resp.strip())
-            all_paths.append(path)
-            if pred is not None:
-                all_preds.append(pred)
+        if scoring == "generate":
+            responses = classify_batch_generate(model, processor, images, device)
+            for resp, path, label in zip(responses, paths, labels):
+                pred = parse_response(resp)
+                all_responses.append(resp.strip())
+                all_paths.append(path)
                 all_labels.append(label)
-                parsed_count += 1
-            else:
-                # Count unparsable as wrong
-                all_preds.append(-1)
-                all_labels.append(label)
+                # Map to probabilities for metric computation
+                if pred is None:
+                    all_probs.append(0.5)
+                else:
+                    all_probs.append(1.0 if pred == 1 else 0.0)
+        else:
+            probs = score_candidates(
+                model, processor, images, ["NORMAL", "PNEUMONIA"], device, length_norm
+            )
+            pneumonia_probs = probs[:, 1].detach().cpu().tolist()
+            all_probs.extend(pneumonia_probs)
+            all_labels.extend(labels)
+            all_paths.extend(paths)
 
-    # Compute accuracy only on successfully parsed responses
-    valid_pairs = [
-        (p, l) for p, l in zip(all_preds, all_labels) if p != -1
-    ]
-    correct = sum(1 for p, l in valid_pairs if p == l)
-    total_valid = len(valid_pairs)
-    total_all = len(all_labels)
-    unparsed = total_all - total_valid
+    metrics = compute_metrics(all_labels, all_probs)
+    print(f"  Total images: {len(all_labels)}")
+    print(f"  Accuracy: {metrics['accuracy']:.4f}")
 
-    accuracy = correct / total_valid if total_valid > 0 else 0
-
-    print(f"  Total images: {total_all}")
-    print(f"  Parsed successfully: {total_valid}/{total_all}")
-    if unparsed > 0:
-        print(f"  Unparsed responses: {unparsed}")
-    print(f"  Correct: {correct}/{total_valid}")
-    print(f"  Accuracy: {accuracy:.4f}")
-
-    # Show some example responses for debugging
-    print(f"  Sample responses (first 10):")
-    for path, resp, label, pred in zip(all_paths, all_responses, all_labels, all_preds):
-        true_label = "PNEUMONIA" if label == 1 else "NORMAL"
-        pred_label = "PNEUMONIA" if pred == 1 else ("NORMAL" if pred == 0 else "UNPARSED")
-        print(f"    {Path(path).name:40s} True: {true_label:12s} Pred: {pred_label:12s} Response: {repr(resp[:50])}")
-        if len([r for r in all_responses if r.strip()]) > 10:
-            break
-
-    return accuracy, correct, total_valid, unparsed
+    return metrics
 
 
 def main():
@@ -171,8 +203,7 @@ def main():
     parser.add_argument(
         "--dataset_dir",
         type=str,
-        default=""
-        "data/chest_xray_small",
+        default="./data/chest_xray",
         help="Path to the chest_xray subdirectory",
     )
     parser.add_argument(
@@ -195,6 +226,26 @@ def main():
         default="test",
         choices=["train", "val", "test", "all"],
         help="Which split to evaluate, or 'all' for every split",
+    )
+    parser.add_argument(
+        "--split_file",
+        type=str,
+        default="",
+        help="Optional split JSON file. If set, dataset_dir is ignored.",
+    )
+    parser.add_argument(
+        "--scoring",
+        type=str,
+        default="loglik",
+        choices=["loglik", "generate"],
+        help="Scoring method for zero-shot",
+    )
+    parser.add_argument(
+        "--length_norm",
+        type=str,
+        default="avg",
+        choices=["avg", "sum"],
+        help="Length normalization for log-likelihood scoring",
     )
     args = parser.parse_args()
 
@@ -237,49 +288,47 @@ def main():
     splits = ["train", "val", "test"] if args.split == "all" else [args.split]
     results = {}
 
+    if args.split_file:
+        split_data = load_split_file(args.split_file)
+    else:
+        split_data = None
+
     for split in splits:
-        dataset = ChestXRayDataset(args.dataset_dir, split=split)
-        if len(dataset) == 0:
-            print(f"  No images found for split '{split}' in {args.dataset_dir}, skipping.")
+        if split_data is not None:
+            samples = split_data.get(split, [])
+        else:
+            samples = list_split_samples(args.dataset_dir, split)
+
+        if len(samples) == 0:
+            print(f"  No images found for split '{split}', skipping.")
             continue
 
-        loader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn
-        )
+        dataset = ImageDataset(samples)
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-        acc, correct, total_valid, unparsed = evaluate_split(
-            model, processor, loader, device, split
+        metrics = evaluate_split(
+            model, processor, loader, device, split, args.scoring, args.length_norm
         )
-        results[split] = {
-            "accuracy": acc,
-            "correct": correct,
-            "total_valid": total_valid,
-            "unparsed": unparsed,
-            "total": len(dataset),
-        }
+        results[split] = metrics
 
     print("\n" + "=" * 60)
-    print("ZERO-SHOT QWEN2.5-VL CLASSIFICATION RESULTS")
+    print("ZERO-SHOT QWEN2-VL CLASSIFICATION RESULTS")
     print("=" * 60)
     for split, r in results.items():
-        print(
-            f"  {split:6s} | Accuracy: {r['accuracy']:.4f} "
-            f"| {r['correct']}/{r['total_valid']} correct "
-            f"| {r['unparsed']} unparsed"
-        )
+        print(f"  {split:6s} | Accuracy: {r['accuracy']:.4f}")
     print("=" * 60)
 
     # Save results as JSON for comparison with MLP
     if "test" in results:
         save_results = {
-            "test_accuracy": results["test"]["accuracy"],
-            "test_correct": results["test"]["correct"],
-            "test_total_valid": results["test"]["total_valid"],
             "model": args.model,
+            "scoring": args.scoring,
+            "length_norm": args.length_norm,
+            "test": results["test"],
         }
         os.makedirs("./output", exist_ok=True)
         save_path = "./output/zero_shot_results.json"
-        with open(save_path, "w") as f:
+        with open(save_path, "w", encoding="utf-8") as f:
             json.dump(save_results, f, indent=2)
         print(f"\nResults saved to {save_path}")
 

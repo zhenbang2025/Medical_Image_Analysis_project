@@ -1,6 +1,11 @@
-torch>=2.1
-transformers>=4.45
+torch==2.2.0
+torchvision==0.17.0
+transformers==4.45.2
 pillow
 tqdm
 accelerate>=0.34
 qwen-vl-utils
+numpy<2
+scikit-learn
+matplotlib
+kagglehub

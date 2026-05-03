@@ -1,0 +1,27 @@
+=== Environment Info ===
+Job ID:    404828
+Node:      dgx-09
+GPU:       NVIDIA H800
+Python:    /home/hxiaoap/.conda/envs/mia/bin/python
+Version:   Python 3.10.20
+PyTorch: 2.2.0+cu121, CUDA: 12.1
+
+=== Zero-shot Evaluation ===
+Start time: 2026-05-03 15:13:22
+Device: cuda, dtype: torch.float16
+Loading model: ./models/Qwen2-VL-2B-Instruct ...
+
+[test] Running zero-shot classification...
+  Total images: 624
+  Accuracy: 0.1506
+
+============================================================
+ZERO-SHOT QWEN2-VL CLASSIFICATION RESULTS
+============================================================
+  test   | Accuracy: 0.1506
+============================================================
+
+Results saved to ./output/zero_shot_results.json
+
+End time: 2026-05-03 15:14:55
+=== Done ===

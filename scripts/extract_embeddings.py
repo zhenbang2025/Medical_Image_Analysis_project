@@ -15,51 +15,36 @@ Notes for Mac:
 
 import argparse
 import os
+from typing import List
+
 import torch
-from pathlib import Path
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
+
+from data_utils import ImageDataset, load_split_file, list_split_samples
 
 
 # Fixed text prompt paired with each image
 PROMPT = "Analyze this chest X-ray image and describe any abnormalities you observe."
 
 
-class ChestXRayDataset(Dataset):
-    def __init__(self, root_dir, split="train"):
-        self.root_dir = Path(root_dir) / split
-        self.samples = []
-        self.labels = []
-
-        for label_idx, class_name in enumerate(["NORMAL", "PNEUMONIA"]):
-            class_dir = self.root_dir / class_name
-            if not class_dir.exists():
-                # some dataset structures nest one extra level
-                class_dir = self.root_dir / "chest_xray" / class_name
-            for img_path in sorted(class_dir.glob("*.jpeg")):
-                self.samples.append(str(img_path))
-                self.labels.append(label_idx)
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img = Image.open(self.samples[idx]).convert("RGB")
-        return img, self.samples[idx], self.labels[idx]
-
-
 def collate_fn(batch):
     images = [item[0] for item in batch]
-    paths = [item[1] for item in batch]
-    labels = [item[2] for item in batch]
+    labels = [item[1] for item in batch]
+    paths = [item[2] for item in batch]
     return images, paths, labels
 
 
-def extract_embeddings(model, processor, images, device):
-    """Run images through Qwen2.5-VL and return mean-pooled embeddings."""
+def masked_mean_pooling(hidden_states: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.unsqueeze(-1).float()
+    masked = hidden_states * mask
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return masked.sum(dim=1) / denom
+
+
+def extract_embeddings(model, processor, images, device, pooling: str):
+    """Run images through Qwen2-VL and return pooled embeddings."""
     texts = [PROMPT] * len(images)
 
     messages = []
@@ -79,18 +64,23 @@ def extract_embeddings(model, processor, images, device):
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    inputs = processor(
-        text=text_inputs,
-        images=images,
-        padding=True,
-        return_tensors="pt",
-    )
+    inputs = processor(text=text_inputs, images=images, padding=True, return_tensors="pt")
     inputs = inputs.to(device)
 
     with torch.no_grad():
         outputs = model(**inputs, output_hidden_states=True)
         hidden_states = outputs.hidden_states[-1]  # (B, seq_len, hidden_dim)
-        embeddings = hidden_states.mean(dim=1)     # (B, hidden_dim)
+        attention_mask = inputs.attention_mask
+
+        if pooling == "vision_only" and hasattr(processor, "image_token_id"):
+            image_mask = inputs.input_ids.eq(processor.image_token_id)
+            if image_mask.sum().item() == 0:
+                # Fallback if vision tokens are not detected
+                embeddings = masked_mean_pooling(hidden_states, attention_mask)
+            else:
+                embeddings = masked_mean_pooling(hidden_states, image_mask)
+        else:
+            embeddings = masked_mean_pooling(hidden_states, attention_mask)
 
     return embeddings.cpu()
 
@@ -100,7 +90,7 @@ def main():
     parser.add_argument(
         "--dataset_dir",
         type=str,
-        default="./data/chest_xray_small",
+        default="./data/chest_xray",
         help="Path to the chest_xray subdirectory containing train/test/val",
     )
     parser.add_argument(
@@ -122,6 +112,19 @@ def main():
         type=str,
         default="./embeddings",
         help="Directory to save embedding files",
+    )
+    parser.add_argument(
+        "--split_file",
+        type=str,
+        default="",
+        help="Optional split JSON file. If set, dataset_dir is ignored.",
+    )
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default="all_tokens",
+        choices=["all_tokens", "vision_only"],
+        help="Pooling mode for embeddings",
     )
     args = parser.parse_args()
 
@@ -168,21 +171,40 @@ def main():
     # Ensure output directory exists
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Prepare splits
+    if args.split_file:
+        splits = load_split_file(args.split_file)
+    else:
+        splits = {
+            split: list_split_samples(args.dataset_dir, split)
+            for split in ["train", "val", "test"]
+        }
+
+    # Constrain max_pixels to avoid OOM (default 12845056 is too large for batch processing)
+    # 3136*28*28 ≈ 2.4M pixels is sufficient for 224x224 images; use 608x608 as practical limit
+    img_proc_dict = processor.image_processor.to_dict()
+    img_proc_dict["max_pixels"] = 608 * 608  # ~370K pixels, well below the 2.4M+ default
+    from transformers import Qwen2VLImageProcessor
+    processor.image_processor = Qwen2VLImageProcessor(**img_proc_dict)
+    print(f"  Image processor max_pixels limited to {processor.image_processor.max_pixels}")
+
     # Process each split
-    for split in ["train", "val", "test"]:
-        dataset = ChestXRayDataset(args.dataset_dir, split=split)
-        if len(dataset) == 0:
+    for split, samples in splits.items():
+        if len(samples) == 0:
             print(f"  No images found for split '{split}', skipping.")
             continue
 
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+        dataset = ImageDataset(samples)
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn
+        )
 
         all_embeddings = []
         all_labels = []
 
         print(f"\n[{split}] Extracting embeddings for {len(dataset)} images...")
         for images, paths, labels in tqdm(loader, desc=split):
-            embeddings = extract_embeddings(model, processor, images, device)
+            embeddings = extract_embeddings(model, processor, images, device, args.pooling)
             all_embeddings.append(embeddings)
             all_labels.extend(labels)
 

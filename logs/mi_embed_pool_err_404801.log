@@ -1,0 +1,36 @@
+/bin/sh: /home/hxiaoap/.conda/envs/mia/lib/libtinfo.so.6: no version information available (required by /bin/sh)
+`Qwen2VLRotaryEmbedding` can now be fully parameterized by passing the model config through the `config` argument. All other arguments will be removed in v4.46
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:16<00:16, 16.80s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:18<00:00,  7.86s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:18<00:00,  9.20s/it]
+train:   0%|          | 0/587 [00:00<?, ?it/s]train:   0%|          | 0/587 [00:05<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/hxiaoap/Medical_Image_Analysis_project/scripts/extract_embeddings.py", line 216, in <module>
+    main()
+  File "/home/hxiaoap/Medical_Image_Analysis_project/scripts/extract_embeddings.py", line 199, in main
+    embeddings = extract_embeddings(model, processor, images, device, args.pooling)
+  File "/home/hxiaoap/Medical_Image_Analysis_project/scripts/extract_embeddings.py", line 71, in extract_embeddings
+    outputs = model(**inputs, output_hidden_states=True)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1511, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1520, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/transformers/models/qwen2_vl/modeling_qwen2_vl.py", line 1691, in forward
+    image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1511, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1520, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/transformers/models/qwen2_vl/modeling_qwen2_vl.py", line 1128, in forward
+    hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1511, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1520, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/transformers/models/qwen2_vl/modeling_qwen2_vl.py", line 431, in forward
+    hidden_states = hidden_states + self.attn(
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1511, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1520, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/hxiaoap/.conda/envs/mia/lib/python3.10/site-packages/transformers/models/qwen2_vl/modeling_qwen2_vl.py", line 404, in forward
+    attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 55.12 GiB. GPU 0 has a total capacity of 79.19 GiB of which 12.51 GiB is free. Including non-PyTorch memory, this process has 66.67 GiB memory in use. Of the allocated memory 65.61 GiB is allocated by PyTorch, and 340.53 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

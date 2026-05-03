@@ -1,0 +1,51 @@
+=== Environment Info ===
+Job ID:    404810
+Node:      dgx-09
+GPU:       NVIDIA H800
+Python:    /home/hxiaoap/.conda/envs/mia/bin/python
+Version:   Python 3.10.20
+PyTorch: 2.2.0+cu121, CUDA: 12.1
+
+=== Extract Embeddings (Pooling Ablation) ===
+Start time: 2026-05-03 14:40:09
+
+>>> Processing pooling=all_tokens
+Device: cuda, dtype: torch.float16
+Loading model: ./models/Qwen2-VL-2B-Instruct ...
+Model loaded. Parameters: 2,208,985,600
+  Image processor max_pixels limited to 369664
+
+[train] Extracting embeddings for 4694 images...
+  Saved ./embeddings/all_tokens/train.pt — embeddings shape: torch.Size([4694, 1536])
+
+[val] Extracting embeddings for 522 images...
+  Saved ./embeddings/all_tokens/val.pt — embeddings shape: torch.Size([522, 1536])
+
+[test] Extracting embeddings for 624 images...
+  Saved ./embeddings/all_tokens/test.pt — embeddings shape: torch.Size([624, 1536])
+
+All embeddings extracted successfully!
+Embedding dimension: 1536
+<<< Done pooling=all_tokens
+
+>>> Processing pooling=vision_only
+Device: cuda, dtype: torch.float16
+Loading model: ./models/Qwen2-VL-2B-Instruct ...
+Model loaded. Parameters: 2,208,985,600
+  Image processor max_pixels limited to 369664
+
+[train] Extracting embeddings for 4694 images...
+  Saved ./embeddings/vision_only/train.pt — embeddings shape: torch.Size([4694, 1536])
+
+[val] Extracting embeddings for 522 images...
+  Saved ./embeddings/vision_only/val.pt — embeddings shape: torch.Size([522, 1536])
+
+[test] Extracting embeddings for 624 images...
+  Saved ./embeddings/vision_only/test.pt — embeddings shape: torch.Size([624, 1536])
+
+All embeddings extracted successfully!
+Embedding dimension: 1536
+<<< Done pooling=vision_only
+
+End time: 2026-05-03 15:12:59
+=== Done ===

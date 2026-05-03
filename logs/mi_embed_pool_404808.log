@@ -1,0 +1,15 @@
+=== Environment Info ===
+Job ID:    404808
+Node:      dgx-09
+GPU:       NVIDIA H800
+Python:    /home/hxiaoap/.conda/envs/mia/bin/python
+Version:   Python 3.10.20
+PyTorch: 2.2.0+cu121, CUDA: 12.1
+
+=== Extract Embeddings (Pooling Ablation) ===
+Start time: 2026-05-03 14:28:52
+
+>>> Processing pooling=all_tokens
+Device: cuda, dtype: torch.float16
+Loading model: ./models/Qwen2-VL-2B-Instruct ...
+Model loaded. Parameters: 2,208,985,600

@@ -1,0 +1,9 @@
+/bin/sh: /home/hxiaoap/.conda/envs/mia/lib/libtinfo.so.6: no version information available (required by /bin/sh)
+`Qwen2VLRotaryEmbedding` can now be fully parameterized by passing the model config through the `config` argument. All other arguments will be removed in v4.46
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:10<00:10, 10.77s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:11<00:00,  5.01s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:11<00:00,  5.87s/it]
+Traceback (most recent call last):
+  File "/home/hxiaoap/Medical_Image_Analysis_project/scripts/extract_embeddings.py", line 224, in <module>
+    main()
+  File "/home/hxiaoap/Medical_Image_Analysis_project/scripts/extract_embeddings.py", line 185, in main
+    img_proc_dict = proc.image_processor.to_dict()
+NameError: name 'proc' is not defined

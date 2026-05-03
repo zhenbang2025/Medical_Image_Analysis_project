@@ -1,0 +1,17 @@
+=== Environment Info ===
+Job ID:    404799
+Node:      dgx-46
+GPU:       NVIDIA H800
+Python:    /home/hxiaoap/.conda/envs/mia/bin/python
+Version:   Python 3.10.20
+PyTorch: 2.11.0+cu130, CUDA: 13.0
+
+=== Extract Embeddings (Pooling Ablation) ===
+Start time: 2026-05-03 13:39:15
+
+>>> Processing pooling=all_tokens
+Device: cuda, dtype: torch.float16
+Loading model: ./models/Qwen2-VL-2B-Instruct ...
+Model loaded. Parameters: 2,208,985,600
+
+[train] Extracting embeddings for 4694 images...
