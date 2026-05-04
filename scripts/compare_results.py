@@ -1,123 +1,68 @@
 """
-Compare MLP vs Qwen baselines (zero-shot + few-shot) for bbox localization.
-
-Usage:
-    python compare_results.py
+Compare multiple result JSON files (MLP and/or VLM baseline outputs).
 """
 
-import json
+import argparse
 import os
+
+from utils.env_utils import env_default
+from utils.run_utils import load_json, prepare_run_dir, save_json
+
+
+def read_metrics(path: str) -> dict:
+    d = load_json(path)
+    if "test_mean_iou" in d:
+        return {
+            "mean_iou": d.get("test_mean_iou", 0.0),
+            "iou_at_0.25": d.get("test_iou_at_0.25", 0.0),
+            "iou_at_0.5": d.get("test_iou_at_0.5", 0.0),
+            "per_class": d.get("test_per_class", {}),
+        }
+    return {
+        "mean_iou": d.get("mean_iou", 0.0),
+        "iou_at_0.25": d.get("iou_at_0.25", 0.0),
+        "iou_at_0.5": d.get("iou_at_0.5", 0.0),
+        "per_class": d.get("per_class", {}),
+    }
 
 
 def main():
-    output_dir = "./output"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--labels", nargs="+", required=True, help="Display labels for each result file.")
+    parser.add_argument("--files", nargs="+", required=True, help="Result JSON files, aligned with --labels.")
+    parser.add_argument("--output_root", type=str, default=env_default("OUTPUT_COMPARE_ROOT", "./output/compare"))
+    parser.add_argument("--run_name", type=str, default=env_default("RUN_NAME"))
+    parser.add_argument("--allow_overwrite", action="store_true")
+    args = parser.parse_args()
 
-    def load(path):
-        if os.path.exists(path):
-            with open(path) as f:
-                return json.load(f)
-        return None
+    if len(args.labels) != len(args.files):
+        raise ValueError("--labels and --files must have the same length.")
 
-    # Load 4 result files
-    plain = load(os.path.join(output_dir, "plain", "bbox_eval.json"))
-    residual = load(os.path.join(output_dir, "residual", "bbox_eval.json"))
-    zs = load(os.path.join(output_dir, "zero_shot_eval.json"))
-    fs = load(os.path.join(output_dir, "few_shot_3_eval.json"))
-
+    run_dir = prepare_run_dir(args.output_root, args.run_name, prefix="compare", allow_overwrite=args.allow_overwrite)
     methods = {}
-    if plain:
-        methods["MLP"] = plain
-    if residual:
-        methods["MLP+Residual"] = residual
-    if zs:
-        methods["Qwen Zero-shot"] = zs
-    if fs:
-        methods["Qwen Few-shot (n=3)"] = fs
+    for label, f in zip(args.labels, args.files):
+        methods[label] = read_metrics(f)
 
-    if not methods:
-        print("No result files found.")
-        return
+    print("\n=== Overall ===")
+    print(f"{'Method':<25} {'MeanIoU':>10} {'@0.25':>10} {'@0.5':>10}")
+    for k, v in methods.items():
+        print(f"{k:<25} {v['mean_iou']:>10.4f} {v['iou_at_0.25']:>10.4f} {v['iou_at_0.5']:>10.4f}")
 
-    names = list(methods.keys())
-
-    # Overall
-    print(f"\n{'='*70}")
-    print(f"BBOX LOCALIZATION: MLP vs Qwen Baselines")
-    print(f"{'='*70}")
-    print(f"\n{'Metric':<15}", end="")
-    for n in names:
-        print(f" {n:>18}", end="")
-    print()
-    print("-" * (15 + 18 * len(names)))
-
-    for label, key in [("Mean IoU", "mean_iou"), ("IoU@0.25", "iou_at_0.25"), ("IoU@0.5", "iou_at_0.5")]:
-        print(f"{label:<15}", end="")
-        for n in names:
-            print(f" {methods[n].get(key, 0):>18.4f}", end="")
-        print()
-
-    # Per-class detailed table
-    classes = ["Atelectasis", "Effusion", "Cardiomegaly"]
-    metrics = [("Mean IoU", "mean_iou"), ("IoU@0.25", "acc_0.25"), ("IoU@0.5", "acc_0.5")]
-
+    classes = sorted({c for m in methods.values() for c in m["per_class"].keys()})
     for cls in classes:
-        print(f"\n{'='*70}")
-        print(f"CLASS: {cls}")
-        print(f"{'='*70}")
-        print(f"{'Metric':<15}", end="")
-        for n in names:
-            print(f" {n:>22}", end="")
-        print()
-        print("-" * (15 + 22 * len(names)))
+        print(f"\n=== {cls} ===")
+        print(f"{'Method':<25} {'MeanIoU':>10} {'@0.25':>10} {'@0.5':>10}")
+        for k, v in methods.items():
+            c = v["per_class"].get(cls, {})
+            print(
+                f"{k:<25} "
+                f"{c.get('mean_iou', 0.0):>10.4f} "
+                f"{c.get('iou_at_0.25', c.get('acc_0.25', 0.0)):>10.4f} "
+                f"{c.get('iou_at_0.5', c.get('acc_0.5', 0.0)):>10.4f}"
+            )
 
-        for label, key in metrics:
-            print(f"{label:<15}", end="")
-            for n in names:
-                d = methods[n]
-                cls_data = d.get(cls, {})
-                if not isinstance(cls_data, dict) or key not in cls_data:
-                    cls_data = d.get("per_class", {}).get(cls, {})
-                val = cls_data.get(key, 0) if isinstance(cls_data, dict) else 0
-                print(f" {val:>22.4f}", end="")
-            print()
-
-    # Improvements
-    print(f"\n{'='*70}")
-    print(f"MLP IMPROVEMENT vs BASELINES")
-    print(f"{'='*70}")
-    for mlp_name, mlp_d in [("MLP", plain), ("MLP+Residual", residual)]:
-        if not mlp_d:
-            continue
-        for base_name, base_d in [("Qwen Zero-shot", zs), ("Qwen Few-shot (n=3)", fs)]:
-            if not base_d:
-                continue
-            d = mlp_d["mean_iou"] - base_d["mean_iou"]
-            pct = d / base_d["mean_iou"] * 100 if base_d["mean_iou"] > 0 else 0
-            sign = "+" if d > 0 else ""
-            print(f"  {mlp_name:<20s} vs {base_name:<25s} : {sign}{d:.4f} IoU ({sign}{pct:.1f}%)")
-
-    print(f"\n{'='*70}")
-
-    # Save
-    comparison = {
-        "methods": names,
-        "overall": {
-            label: {n: methods[n].get(key, 0) for n in names}
-            for label, key in [("mean_iou", "mean_iou"), ("iou_at_0.25", "iou_at_0.25"), ("iou_at_0.5", "iou_at_0.5")]
-        },
-        "per_class": {
-            cls: {
-                n: (methods[n].get(cls, {}).get("mean_iou", 0)
-                    if isinstance(methods[n].get(cls), dict) and "mean_iou" in methods[n].get(cls, {})
-                    else methods[n].get("per_class", {}).get(cls, {}).get("mean_iou", 0))
-                for n in names
-            }
-            for cls in classes
-        },
-    }
-    with open(os.path.join(output_dir, "comparison.json"), "w") as f:
-        json.dump(comparison, f, indent=2)
-    print(f"Saved to ./output/comparison.json")
+    save_json(os.path.join(run_dir, "comparison.json"), {"methods": methods, "classes": classes, "files": args.files})
+    print(f"\nSaved comparison to: {run_dir}")
 
 
 if __name__ == "__main__":

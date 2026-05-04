@@ -1,222 +1,194 @@
 """
-Extract embeddings for 3 target classes from NIH ChestX-ray14 dataset.
+Extract normalized bbox datasets with selectable embedding pooling modes.
 
-For each class, selects 40 images (30 train + 10 test) with bbox annotations.
-Uses a class-specific short prompt so the embedding encodes "what to look for".
-Saves all embeddings + bbox + class labels into a single file for unified training.
-
-Usage:
-    python extract_bbox_embeddings.py
-
-Target classes:
-    - Atelectasis (lung collapse)
-    - Effusion (pleural effusion)
-    - Cardiomegaly (heart enlargement)
+Key features:
+1. Patient-level split (train/val/test) to reduce leakage.
+2. Box normalization to [0, 1] coordinates.
+3. Two embedding modes:
+   - all_token_mean
+   - image_token_mean
+4. Non-overwriting run directory output.
 """
 
 import argparse
-import csv
-import json
 import os
-import random
-import torch
 from pathlib import Path
+
+import torch
 from PIL import Image
 from tqdm import tqdm
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
-DEFAULT_CLASSES = ["Atelectasis", "Effusion", "Cardiomegaly"]
-TRAIN_PER_CLASS = 30
-TEST_PER_CLASS = 10
+from utils.bbox_utils import normalize_xywh
+from utils.data_utils import cap_per_class, find_image_paths, load_bbox_rows, stratified_patient_split
+from utils.env_utils import env_default, env_int
+from utils.run_utils import prepare_run_dir, resolve_device, save_json
+
 
 CLASS_PROMPTS = {
-    "Atelectasis": "Describe lung collapse in this X-ray.",
-    "Effusion": "Describe pleural effusion in this X-ray.",
-    "Cardiomegaly": "Describe heart enlargement in this X-ray.",
+    "Atelectasis": "Locate atelectasis in this chest X-ray. Focus on collapsed lung regions.",
+    "Effusion": "Locate pleural effusion in this chest X-ray. Focus on fluid accumulation zones.",
+    "Cardiomegaly": "Locate cardiomegaly in this chest X-ray. Focus on enlarged heart silhouette.",
 }
 
 
-def extract_batch_embeddings(model, processor, images, class_name, device):
-    """Extract embeddings for a batch of images with class-specific prompt."""
-    prompt = CLASS_PROMPTS[class_name]
-    messages = []
-    for _ in images:
-        messages.append([{
+def build_inputs(processor, image: Image.Image, prompt: str):
+    messages = [
+        {
             "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt},
-            ],
-        }])
+            "content": [{"type": "image"}, {"type": "text", "text": prompt}],
+        }
+    ]
+    text_inputs = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return processor(text=text_inputs, images=[image], padding=True, return_tensors="pt")
 
-    text_inputs = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = processor(
-        text=text_inputs,
-        images=images,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = inputs.to(device)
 
-    with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True)
-        hidden_states = outputs.hidden_states[-1]
-        embeddings = hidden_states.mean(dim=1)
+def pooled_embedding(outputs, inputs, model, mode: str) -> torch.Tensor:
+    hs = outputs.hidden_states[-1]  # [B, T, D]
+    if mode == "all_token_mean":
+        return hs.mean(dim=1)
 
-    return embeddings.cpu()
+    image_token_id = getattr(model.config, "image_token_id", None)
+    if image_token_id is None or "input_ids" not in inputs:
+        return hs.mean(dim=1)
+
+    mask = (inputs["input_ids"] == image_token_id).unsqueeze(-1)  # [B, T, 1]
+    counts = mask.sum(dim=1).clamp(min=1)
+    return (hs * mask).sum(dim=1) / counts
+
+
+def extract_split_embeddings(split_rows, model, processor, device, mode, class2idx):
+    embs, bbox_norm, bbox_abs, labels, sizes, meta = [], [], [], [], [], []
+    for row in tqdm(split_rows, desc="Extracting", leave=False):
+        img = Image.open(row["path"]).convert("RGB")
+        w, h = img.size
+        inputs = build_inputs(processor, img, CLASS_PROMPTS[row["class"]])
+        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
+            emb = pooled_embedding(outputs, inputs, model, mode).cpu().squeeze(0)
+
+        abs_box = torch.tensor([row["x"], row["y"], row["w"], row["h"]], dtype=torch.float32)
+        sz = torch.tensor([w, h], dtype=torch.float32)
+        norm_box = normalize_xywh(abs_box.unsqueeze(0), sz.unsqueeze(0)).squeeze(0)
+
+        embs.append(emb)
+        bbox_abs.append(abs_box)
+        bbox_norm.append(norm_box)
+        labels.append(class2idx[row["class"]])
+        sizes.append(sz)
+        meta.append(
+            {
+                "name": row["name"],
+                "path": row["path"],
+                "class": row["class"],
+                "patient_id": row["patient_id"],
+                "width": float(w),
+                "height": float(h),
+                "bbox_abs_xywh": [row["x"], row["y"], row["w"], row["h"]],
+                "bbox_norm_xywh": norm_box.tolist(),
+            }
+        )
+    return {
+        "embeddings": torch.stack(embs),
+        "bbox_abs_xywh": torch.stack(bbox_abs),
+        "bbox_norm_xywh": torch.stack(bbox_norm),
+        "image_sizes_wh": torch.stack(sizes),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "meta": meta,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="./data/3")
-    parser.add_argument("--bbox_csv", type=str, default="./data/3/BBox_List_2017.csv")
-    parser.add_argument("--classes", nargs="+", default=DEFAULT_CLASSES)
-    parser.add_argument("--model", type=str, default="./models/Qwen2-VL-2B-Instruct")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--device", type=str, default="auto",
-                        choices=["auto", "mps", "cuda", "cpu"])
-    parser.add_argument("--output_dir", type=str, default="./embeddings")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data_root", type=str, default=env_default("DATA_ROOT", "./data/3"))
+    parser.add_argument("--bbox_csv", type=str, default=env_default("BBOX_CSV", "./data/3/BBox_List_2017.csv"))
+    parser.add_argument("--classes", nargs="+", default=["Atelectasis", "Effusion", "Cardiomegaly"])
+    parser.add_argument("--model", type=str, default=env_default("MODEL_PATH", "./models/Qwen2-VL-2B-Instruct"))
+    parser.add_argument("--device", type=str, default=env_default("DEVICE", "auto"), choices=["auto", "cuda", "mps", "cpu"])
+    parser.add_argument("--embedding_mode", type=str, default="all_token_mean",
+                        choices=["all_token_mean", "image_token_mean"])
+    parser.add_argument("--max_per_class", type=int, default=env_int("MAX_PER_CLASS", 2200),
+                        help="Cap each class to this many rows before split.")
+    parser.add_argument("--seed", type=int, default=env_int("SEED", 42))
+    parser.add_argument("--output_root", type=str, default=env_default("EMBEDDINGS_ROOT", "./embeddings"))
+    parser.add_argument("--run_name", type=str, default=env_default("RUN_NAME"))
+    parser.add_argument("--allow_overwrite", action="store_true")
     args = parser.parse_args()
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    run_dir = prepare_run_dir(
+        output_root=args.output_root,
+        run_name=args.run_name,
+        prefix=f"emb_{args.embedding_mode}",
+        allow_overwrite=args.allow_overwrite,
+    )
+    os.makedirs(run_dir, exist_ok=True)
 
-    # Device
-    if args.device == "auto":
-        if torch.backends.mps.is_available():
-            device = torch.device("mps")
-            dtype = torch.float16
-        elif torch.cuda.is_available():
-            device = torch.device("cuda")
-            dtype = torch.float16
-        else:
-            device = torch.device("cpu")
-            dtype = torch.float32
-    elif args.device == "mps":
-        device = torch.device("mps")
-        dtype = torch.float16
-    elif args.device == "cuda":
-        device = torch.device("cuda")
-        dtype = torch.float16
-    else:
-        device = torch.device("cpu")
-        dtype = torch.float32
+    image_map = find_image_paths(args.data_root)
+    rows = load_bbox_rows(args.bbox_csv, args.classes)
+    rows = [r for r in rows if r["name"] in image_map]
+    for r in rows:
+        r["path"] = image_map[r["name"]]
+    rows = cap_per_class(rows, args.classes, args.max_per_class, seed=args.seed)
 
-    print(f"Device: {device}, dtype: {dtype}")
-    print(f"Loading model: {args.model} ...")
-    if device.type == "cpu":
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            args.model, torch_dtype=dtype, device_map="cpu",
-        )
-    else:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            args.model, torch_dtype=dtype, device_map="auto",
-        )
-    processor = AutoProcessor.from_pretrained(args.model)
-    print(f"Model loaded.")
-
-    # Parse bbox CSV
-    class_samples = {cls: [] for cls in args.classes}
-    with open(args.bbox_csv) as f:
-        reader = csv.reader(f)
-        next(reader)
-        for row in reader:
-            label = row[1]
-            if label not in args.classes:
-                continue
-            x, y, w, h = float(row[2]), float(row[3]), float(row[4]), float(row[5])
-
-            img_path = None
-            for d in sorted(Path(args.data_dir).iterdir()):
-                if d.is_dir() and d.name.startswith("images_"):
-                    path = d / "images" / row[0]
-                    if path.exists():
-                        img_path = path
-                        break
-            if img_path is None:
-                continue
-
-            class_samples[label].append((str(img_path), row[0], x, y, w, h))
-
-    # Select and split, then extract
+    split = stratified_patient_split(rows, args.classes, train_ratio=0.7, val_ratio=0.15, seed=args.seed)
     class2idx = {c: i for i, c in enumerate(args.classes)}
-    total_per_class = TRAIN_PER_CLASS + TEST_PER_CLASS
 
-    # Accumulators: list of dicts, then split at end
-    train_embs, train_bbox, train_labels = [], [], []
-    test_embs, test_bbox, test_labels = [], [], []
-    meta = {"train": [], "test": []}
+    device, dtype = resolve_device(args.device)
+    print(f"Device={device}, dtype={dtype}, mode={args.embedding_mode}")
+    print(f"Loading model: {args.model}")
+    if device.type == "cpu":
+        model = Qwen2VLForConditionalGeneration.from_pretrained(args.model, torch_dtype=dtype, device_map="cpu")
+    else:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(args.model, torch_dtype=dtype, device_map="auto")
+    processor = AutoProcessor.from_pretrained(args.model)
 
-    for cls_name in args.classes:
-        samples = class_samples[cls_name]
-        if len(samples) < total_per_class:
-            print(f"Warning: {cls_name} has only {len(samples)} samples, need {total_per_class}")
-            selected = samples
-        else:
-            selected = random.sample(samples, total_per_class)
+    for s in ("train", "val", "test"):
+        total = len(split[s])
+        print(f"\n=== {s} ({total}) ===")
+        for cls in args.classes:
+            cnt = sum(1 for r in split[s] if r["class"] == cls)
+            print(f"  {cls}: {cnt}")
 
-        random.shuffle(selected)
-        train_samples = selected[:TRAIN_PER_CLASS]
-        test_samples = selected[TRAIN_PER_CLASS:]
+    train_data = extract_split_embeddings(split["train"], model, processor, device, args.embedding_mode, class2idx)
+    val_data = extract_split_embeddings(split["val"], model, processor, device, args.embedding_mode, class2idx)
+    test_data = extract_split_embeddings(split["test"], model, processor, device, args.embedding_mode, class2idx)
 
-        for split, subsamples in [("train", train_samples), ("test", test_samples)]:
-            label_idx = class2idx[cls_name]
+    # Build split statistics report
+    split_stats = {}
+    for s in ("train", "val", "test"):
+        split_stats[s] = {"total": len(split[s]), "per_class": {}}
+        for cls in args.classes:
+            split_stats[s]["per_class"][cls] = sum(1 for r in split[s] if r["class"] == cls)
 
-            for i in tqdm(range(0, len(subsamples), args.batch_size),
-                          desc=f"{cls_name}/{split}", leave=False):
-                batch = subsamples[i:i + args.batch_size]
-                batch_paths = [s[0] for s in batch]
-                batch_images = [Image.open(p).convert("RGB") for p in batch_paths]
+    torch.save({k: v for k, v in train_data.items() if k != "meta"}, os.path.join(run_dir, "train.pt"))
+    torch.save({k: v for k, v in val_data.items() if k != "meta"}, os.path.join(run_dir, "val.pt"))
+    torch.save({k: v for k, v in test_data.items() if k != "meta"}, os.path.join(run_dir, "test.pt"))
 
-                embs = extract_batch_embeddings(model, processor, batch_images, cls_name, device)
-
-                for emb, (path, name, x, y, w, h) in zip(embs, batch):
-                    if split == "train":
-                        train_embs.append(emb)
-                        train_bbox.append(torch.tensor([x, y, w, h], dtype=torch.float32))
-                        train_labels.append(label_idx)
-                    else:
-                        test_embs.append(emb)
-                        test_bbox.append(torch.tensor([x, y, w, h], dtype=torch.float32))
-                        test_labels.append(label_idx)
-
-                    meta[split].append({
-                        "class": cls_name,
-                        "path": path,
-                        "name": name,
-                        "x": x, "y": y, "w": w, "h": h,
-                    })
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    torch.save({
-        "embeddings": torch.stack(train_embs),
-        "bboxes": torch.stack(train_bbox),
-        "labels": torch.tensor(train_labels, dtype=torch.long),
-    }, os.path.join(args.output_dir, "bbox_train.pt"))
-
-    torch.save({
-        "embeddings": torch.stack(test_embs),
-        "bboxes": torch.stack(test_bbox),
-        "labels": torch.tensor(test_labels, dtype=torch.long),
-    }, os.path.join(args.output_dir, "bbox_test.pt"))
-
-    with open(os.path.join(args.output_dir, "bbox_meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-    with open(os.path.join(args.output_dir, "class_prompts.json"), "w") as f:
-        json.dump(CLASS_PROMPTS, f, indent=2)
-    with open(os.path.join(args.output_dir, "class_names.json"), "w") as f:
-        json.dump({"classes": args.classes, "class2idx": class2idx}, f, indent=2)
-
-    print(f"\nDone!")
-    print(f"  Train: {len(train_embs)} samples")
-    print(f"  Test:  {len(test_embs)} samples")
-    print(f"  Classes: {args.classes}")
-    print(f"  Embedding dim: {train_embs[0].shape[0]}")
-    print(f"  Saved to {args.output_dir}/")
+    save_json(os.path.join(run_dir, "meta.json"), {
+        "train": train_data["meta"],
+        "val": val_data["meta"],
+        "test": test_data["meta"],
+    })
+    save_json(os.path.join(run_dir, "split_stats.json"), split_stats)
+    save_json(os.path.join(run_dir, "class_names.json"), {"classes": args.classes, "class2idx": class2idx})
+    save_json(os.path.join(run_dir, "class_prompts.json"), CLASS_PROMPTS)
+    save_json(
+        os.path.join(run_dir, "config.json"),
+        {
+            "data_root": str(Path(args.data_root).resolve()),
+            "bbox_csv": str(Path(args.bbox_csv).resolve()),
+            "model": args.model,
+            "device": str(device),
+            "dtype": str(dtype),
+            "embedding_mode": args.embedding_mode,
+            "max_per_class": args.max_per_class,
+            "seed": args.seed,
+            "run_dir": str(Path(run_dir).resolve()),
+        },
+    )
+    print(f"Saved embedding run to: {run_dir}")
 
 
 if __name__ == "__main__":

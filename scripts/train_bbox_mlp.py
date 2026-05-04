@@ -1,308 +1,208 @@
 """
-Train a single MLP for bbox regression on all classes.
+Train MLP bbox regressor on pre-extracted embeddings.
 
-The class-specific prompt is baked into the embedding during extraction,
-so the MLP only needs to regress bbox coordinates (x, y, w, h).
-
-Usage:
-    python train_bbox_mlp.py [--epochs 100] [--lr 1e-3]
-
-Data:
-    - embeddings/bbox_train.pt: 90 samples (30 per class)
-    - embeddings/bbox_test.pt:  30 samples (10 per class)
+Supports:
+- architectures: plain / residual
+- losses: smoothl1 / iou / ciou
+- normalized bbox targets
+- no-overwrite run directory
 """
 
 import argparse
-import json
 import os
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-matplotlib = None
-plt = None
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except ImportError:
-    pass
+from utils.bbox_utils import ciou_xywh, iou_xywh
+from utils.env_utils import env_default, env_float, env_int
+from utils.models import BBoxMLP
+from utils.run_utils import load_json, prepare_run_dir, resolve_device, save_json
 
 
-class EmbeddingDataset(Dataset):
-    def __init__(self, embeddings, bboxes, labels):
-        self.embeddings = embeddings
-        self.bboxes = bboxes
-        self.labels = labels
+def make_loss(loss_name: str):
+    if loss_name == "smoothl1":
+        base = nn.SmoothL1Loss()
 
-    def __len__(self):
-        return len(self.labels)
+        def _loss(pred, target):
+            return base(pred, target)
 
-    def __getitem__(self, idx):
-        return self.embeddings[idx], self.bboxes[idx], self.labels[idx]
+        return _loss
 
+    if loss_name == "iou":
+        def _loss(pred, target):
+            return (1.0 - iou_xywh(pred, target)).mean()
 
-class BBoxMLP(nn.Module):
-    """MLP with residual connections and LayerNorm for bbox regression."""
+        return _loss
 
-    def __init__(self, input_dim, hidden_dim=256, dropout=0.2, use_residual=False):
-        super().__init__()
-        self.use_residual = use_residual
+    if loss_name == "ciou":
+        def _loss(pred, target):
+            return (1.0 - ciou_xywh(pred, target)).mean()
 
-        # Project input to hidden_dim
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        return _loss
 
-        # Residual block
-        self.res_block = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, hidden_dim),
-        )
-
-        # Skip connection projection (hidden_dim -> hidden_dim)
-        self.skip_proj = nn.Linear(hidden_dim, hidden_dim)
-
-        # Output head
-        self.output = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 4),
-        )
-
-    def forward(self, x):
-        h = self.input_proj(x)
-
-        if self.use_residual:
-            h = self.res_block(h) + self.skip_proj(h)
-        else:
-            h = self.res_block(h)
-
-        return self.output(h)
+    raise ValueError(f"Unknown loss: {loss_name}")
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
-    model.train()
-    total_loss = 0
-    total = 0
-
-    for embeddings, bboxes, _ in loader:
-        embeddings = embeddings.to(device)
-        bboxes = bboxes.to(device)
-
-        optimizer.zero_grad()
-        pred = model(embeddings)
-        loss = criterion(pred, bboxes)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * embeddings.size(0)
-        total += embeddings.size(0)
-
-    return total_loss / total
-
-
-@torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, device):
     model.eval()
-    total_loss = 0
-    total = 0
-    all_pred = []
-    all_true = []
-    all_labels = []
-
-    for embeddings, bboxes, labels in loader:
-        embeddings = embeddings.to(device)
-        bboxes = bboxes.to(device)
-
-        pred = model(embeddings)
-        loss = criterion(pred, bboxes)
-
-        total_loss += loss.item() * embeddings.size(0)
-        total += embeddings.size(0)
-        all_pred.append(pred.cpu())
-        all_true.append(bboxes.cpu())
-        all_labels.append(labels)
-
-    all_pred = torch.cat(all_pred)
-    all_true = torch.cat(all_true)
-    all_labels = torch.cat(all_labels)
-    iou = compute_iou(all_pred, all_true)
-
-    return total_loss / total, iou, all_labels
+    all_pred, all_true, all_labels = [], [], []
+    with torch.no_grad():
+        for x, y, labels in loader:
+            x = x.to(device)
+            pred = torch.sigmoid(model(x)).cpu()
+            all_pred.append(pred)
+            all_true.append(y)
+            all_labels.append(labels)
+    pred = torch.cat(all_pred)
+    true = torch.cat(all_true)
+    labels = torch.cat(all_labels)
+    ious = iou_xywh(pred, true)
+    return ious, labels
 
 
-def compute_iou(pred, true):
-    pred = pred.clamp(min=0)
-    true = true.clamp(min=0)
-    pred_x1 = pred[:, 0]
-    pred_y1 = pred[:, 1]
-    pred_x2 = pred[:, 0] + pred[:, 2]
-    pred_y2 = pred[:, 1] + pred[:, 3]
-    true_x1 = true[:, 0]
-    true_y1 = true[:, 1]
-    true_x2 = true[:, 0] + true[:, 2]
-    true_y2 = true[:, 1] + true[:, 3]
-    inter_x1 = torch.max(pred_x1, true_x1)
-    inter_y1 = torch.max(pred_y1, true_y1)
-    inter_x2 = torch.min(pred_x2, true_x2)
-    inter_y2 = torch.min(pred_y2, true_y2)
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
-    pred_area = pred[:, 2] * pred[:, 3]
-    true_area = true[:, 2] * true[:, 3]
-    union_area = pred_area + true_area - inter_area
-    return inter_area / (union_area + 1e-6)
-
-
-def plot_history(history, output_dir):
-    if plt is None:
-        return
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    epochs = range(1, len(history["train_loss"]) + 1)
-    axes[0].plot(epochs, history["train_loss"], "b-", label="Train")
-    axes[0].plot(epochs, history["val_loss"], "r-", label="Val")
-    axes[0].set_title("Loss")
-    axes[0].legend()
-    axes[1].plot(epochs, history["val_iou"], "g-", label="Val IoU")
-    axes[1].set_title("IoU")
-    axes[1].legend()
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, "bbox_training_curves.png")
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    print(f"Curves saved to {save_path}")
+def per_class_metrics(ious: torch.Tensor, labels: torch.Tensor, classes: list[str]) -> dict:
+    out = {}
+    for i, cls in enumerate(classes):
+        mask = labels == i
+        if mask.sum() == 0:
+            continue
+        c = ious[mask]
+        out[cls] = {
+            "count": int(mask.sum()),
+            "mean_iou": float(c.mean()),
+            "iou_at_0.25": float((c >= 0.25).float().mean()),
+            "iou_at_0.5": float((c >= 0.5).float().mean()),
+        }
+    return out
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--embedding_dir", type=str, default="./embeddings")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use_residual", action="store_true",
-                        help="Use residual connections with LayerNorm")
-    parser.add_argument("--output_dir", type=str, default="./output")
+    embedding_default = env_default("EMBEDDING_DIR")
+    parser.add_argument(
+        "--embedding_dir",
+        type=str,
+        default=embedding_default,
+        required=embedding_default is None,
+    )
+    parser.add_argument("--output_root", type=str, default=env_default("OUTPUT_TRAIN_ROOT", "./output/train"))
+    parser.add_argument("--run_name", type=str, default=env_default("RUN_NAME"))
+    parser.add_argument("--allow_overwrite", action="store_true")
+    parser.add_argument("--arch", type=str, default=env_default("ARCH", "residual"), choices=["plain", "residual"])
+    parser.add_argument("--loss", type=str, default=env_default("LOSS_NAME", "smoothl1"), choices=["smoothl1", "iou", "ciou"])
+    parser.add_argument("--epochs", type=int, default=env_int("EPOCHS", 100))
+    parser.add_argument("--batch_size", type=int, default=env_int("BATCH_SIZE", 64))
+    parser.add_argument("--hidden_dim", type=int, default=env_int("HIDDEN_DIM", 256))
+    parser.add_argument("--dropout", type=float, default=env_float("DROPOUT", 0.2))
+    parser.add_argument("--lr", type=float, default=env_float("LR", 1e-3))
+    parser.add_argument("--weight_decay", type=float, default=env_float("WEIGHT_DECAY", 1e-4))
+    parser.add_argument("--seed", type=int, default=env_int("SEED", 42))
+    parser.add_argument("--device", type=str, default=env_default("DEVICE", "auto"), choices=["auto", "cuda", "mps", "cpu"])
     args = parser.parse_args()
 
-    model_tag = "residual" if args.use_residual else "plain"
-    args.output_dir = os.path.join(args.output_dir, model_tag)
-
     torch.manual_seed(args.seed)
+    device, _ = resolve_device(args.device)
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    os.makedirs(args.output_dir, exist_ok=True)
+    run_dir = prepare_run_dir(
+        args.output_root,
+        args.run_name,
+        prefix=f"train_{args.arch}_{args.loss}",
+        allow_overwrite=args.allow_overwrite,
+    )
+    print(f"Run dir: {run_dir}")
 
-    # Load class names
-    with open(os.path.join(args.embedding_dir, "class_names.json")) as f:
-        class_info = json.load(f)
+    train = torch.load(os.path.join(args.embedding_dir, "train.pt"), weights_only=True)
+    val = torch.load(os.path.join(args.embedding_dir, "val.pt"), weights_only=True)
+    test = torch.load(os.path.join(args.embedding_dir, "test.pt"), weights_only=True)
+    class_info = load_json(os.path.join(args.embedding_dir, "class_names.json"))
     classes = class_info["classes"]
 
-    # Load data
-    train_data = torch.load(os.path.join(args.embedding_dir, "bbox_train.pt"), weights_only=True)
-    test_data = torch.load(os.path.join(args.embedding_dir, "bbox_test.pt"), weights_only=True)
-
-    # Cast to float32 for MPS compatibility
-    train_data["embeddings"] = train_data["embeddings"].float()
-    test_data["embeddings"] = test_data["embeddings"].float()
-
-    train_ds = EmbeddingDataset(train_data["embeddings"], train_data["bboxes"], train_data["labels"])
-    test_ds = EmbeddingDataset(test_data["embeddings"], test_data["bboxes"], test_data["labels"])
-
+    train_ds = TensorDataset(train["embeddings"].float(), train["bbox_norm_xywh"].float(), train["labels"])
+    val_ds = TensorDataset(val["embeddings"].float(), val["bbox_norm_xywh"].float(), val["labels"])
+    test_ds = TensorDataset(test["embeddings"].float(), test["bbox_norm_xywh"].float(), test["labels"])
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
-    input_dim = train_data["embeddings"].shape[1]
-
-    model = BBoxMLP(input_dim, args.hidden_dim, args.dropout, args.use_residual).to(device)
-    criterion = nn.SmoothL1Loss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    in_dim = train["embeddings"].shape[1]
+    model = BBoxMLP(in_dim, hidden_dim=args.hidden_dim, dropout=args.dropout, arch=args.arch).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    criterion = make_loss(args.loss)
 
-    print(f"Input dim: {input_dim}")
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Residual: {args.use_residual}")
-    print(f"Device: {device}")
-    print(f"Train: {len(train_ds)}, Test: {len(test_ds)}")
-    print(f"Classes: {classes}")
-    print()
-
-    best_val_iou = -1
-    best_model_state = None
-    history = {"train_loss": [], "val_loss": [], "val_iou": [], "val_iou_per_class": []}
+    best_iou = -1.0
+    best_state = None
+    history = []
 
     for epoch in range(1, args.epochs + 1):
-        t_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        v_loss, v_ious, v_labels = evaluate(model, test_loader, criterion, device)
+        model.train()
+        epoch_loss = 0.0
+        n = 0
+        for x, y, _ in tqdm(train_loader, desc=f"Epoch {epoch:03d}", leave=False):
+            x = x.to(device)
+            y = y.to(device)
+            pred = torch.sigmoid(model(x))
+            loss = criterion(pred, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * x.size(0)
+            n += x.size(0)
         scheduler.step()
 
-        v_mean_iou = v_ious.mean().item()
+        val_ious, val_labels = evaluate(model, val_loader, device)
+        val_mean_iou = float(val_ious.mean())
+        train_loss = epoch_loss / max(1, n)
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_mean_iou": val_mean_iou})
 
-        history["train_loss"].append(t_loss)
-        history["val_loss"].append(v_loss)
-        history["val_iou"].append(v_mean_iou)
-
-        # Per-class IoU
-        per_class = {}
-        for i, cls in enumerate(classes):
-            mask = v_labels == i
-            if mask.sum() > 0:
-                per_class[cls] = v_ious[mask].mean().item()
-        history["val_iou_per_class"].append(per_class)
+        if val_mean_iou > best_iou:
+            best_iou = val_mean_iou
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         if epoch <= 10 or epoch % 10 == 0 or epoch == args.epochs:
-            detail = " ".join(f"{k}:{v:.3f}" for k, v in per_class.items())
-            print(f"Epoch {epoch:03d} | Train: {t_loss:.4f} | Val Loss: {v_loss:.4f} IoU: {v_mean_iou:.4f} | {detail}")
+            print(f"Epoch {epoch:03d} | train_loss={train_loss:.5f} | val_mean_iou={val_mean_iou:.5f}")
 
-        if v_mean_iou > best_val_iou:
-            best_val_iou = v_mean_iou
-            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+    model.load_state_dict(best_state)
+    val_ious, val_labels = evaluate(model, val_loader, device)
+    test_ious, test_labels = evaluate(model, test_loader, device)
 
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-
-    _, final_ious, _ = evaluate(model, test_loader, criterion, device)
-    final_mean = final_ious.mean().item()
-
-    print(f"\nBest Val IoU: {best_val_iou:.4f}")
-    print(f"Final Test IoU: {final_mean:.4f}")
-
-    # Save model
-    save_path = os.path.join(args.output_dir, "bbox_mlp.pt")
-    torch.save({
+    ckpt = {
         "model_state_dict": model.state_dict(),
-        "input_dim": input_dim,
+        "input_dim": in_dim,
         "hidden_dim": args.hidden_dim,
         "dropout": args.dropout,
-        "use_residual": args.use_residual,
+        "arch": args.arch,
+        "loss": args.loss,
         "classes": classes,
-        "best_val_iou": best_val_iou,
-    }, save_path)
-
-    # Save results
-    results = {
-        "best_val_iou": best_val_iou,
-        "test_mean_iou": final_mean,
-        "model_tag": model_tag,
-        "use_residual": args.use_residual,
-        "epochs": args.epochs,
-        "lr": args.lr,
-        "hidden_dim": args.hidden_dim,
+        "best_val_mean_iou": float(val_ious.mean()),
+        "embedding_dir": args.embedding_dir,
     }
-    with open(os.path.join(args.output_dir, "results.json"), "w") as f:
-        json.dump(results, f, indent=2)
+    torch.save(ckpt, os.path.join(run_dir, "bbox_mlp.pt"))
 
-    plot_history(history, args.output_dir)
-    print(f"Model saved to {save_path}")
+    result = {
+        "arch": args.arch,
+        "loss": args.loss,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "seed": args.seed,
+        "embedding_dir": args.embedding_dir,
+        "best_val_mean_iou": float(val_ious.mean()),
+        "best_val_iou_at_0.25": float((val_ious >= 0.25).float().mean()),
+        "best_val_iou_at_0.5": float((val_ious >= 0.5).float().mean()),
+        "test_mean_iou": float(test_ious.mean()),
+        "test_iou_at_0.25": float((test_ious >= 0.25).float().mean()),
+        "test_iou_at_0.5": float((test_ious >= 0.5).float().mean()),
+        "val_per_class": per_class_metrics(val_ious, val_labels, classes),
+        "test_per_class": per_class_metrics(test_ious, test_labels, classes),
+        "history": history,
+    }
+    save_json(os.path.join(run_dir, "train_result.json"), result)
+    print(f"Saved model/result to: {run_dir}")
 
 
 if __name__ == "__main__":

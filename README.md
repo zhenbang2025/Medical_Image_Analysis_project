@@ -1,156 +1,234 @@
-# Chest X-Ray Bounding Box Localization
+# Chest X-Ray BBox Localization (Qwen2-VL + MLP)
 
-Adapt Qwen2-VL vision-language model for medical image bounding box localization by training lightweight MLP heads on top of frozen image embeddings.
+本项目用于 NIH ChestX-ray14 三类病灶框定位（Atelectasis / Effusion / Cardiomegaly），目标是让 **VLM+MLP** 超过 **Zero-shot / Few-shot VLM baseline**。
 
-## Overview
+---
 
-This project compares two paradigms for adapting large vision-language models (VLMs) to medical image bounding box localization:
+## 1. 环境配置（`mia`）
 
-1. **Zero-shot / Few-shot prompting** — Query the VLM directly to predict bbox coordinates
-2. **MLP fine-tuning** — Extract image embeddings with class-specific prompts, train a small MLP on top
-
-| Dataset | Classes | Train / Test per class |
-|---|---|---|
-| NIH ChestX-ray14 | Atelectasis, Effusion, Cardiomegaly | 30 / 10 |
-
-## Results
-
-### Overall Performance
-
-| Method | Mean IoU | IoU@0.25 | IoU@0.5 |
-|---|---|---|---|
-| Plain MLP | 0.047 | 0.067 | 0.000 |
-| **MLP + Residual** | **0.219** | **0.433** | **0.100** |
-| Qwen Zero-shot | 0.070 | 0.167 | 0.000 |
-| **Qwen Few-shot (n=3)** | **0.254** | **0.467** | **0.167** |
-
-### Per-class Breakdown
-
-| Class | Plain MLP | MLP+Residual | Qwen Zero-shot | Qwen Few-shot (n=3) |
-|---|---|---|---|---|
-| **Atelectasis** | 0.014 / 0.000 | 0.098 / 0.100 | 0.036 / 0.100 | 0.064 / 0.100 |
-| **Effusion** | 0.124 / 0.200 | 0.119 / 0.200 | 0.063 / 0.100 | 0.186 / 0.400 |
-| **Cardiomegaly** | 0.004 / 0.000 | 0.440 / 1.000 | 0.110 / 0.300 | 0.511 / 0.900 |
-
-*Per-class values show Mean IoU / IoU@0.25*
-
-### Analysis
-
-- **Residual connections are essential**: Plain MLP collapses to near-zero predictions (all samples converge to a single point). Adding residual connections with LayerNorm improves mean IoU by **213.7%** over zero-shot.
-- **Few-shot still leads**: Qwen with 3 exemplars achieves 0.254 IoU, 13.8% above MLP+Residual. The VLM's pre-trained spatial reasoning provides an edge that small supervised sets can't fully close.
-- **Cardiomegaly is easiest**: Largest, most anatomically stable structure. MLP+Residual reaches 0.44 IoU (100% @0.25), few-shot reaches 0.51 (90% @0.25).
-- **Atelectasis is hardest**: Small, variable regions. All methods struggle (< 0.1 IoU). Suggests need for more data or class-specific architectures.
-- **Effusion is mixed**: High variance — some samples are well-localized (large effusions), others fail (small/subtle ones).
-
-## Setup
+### 1.1 创建环境
 
 ```bash
+conda create -n mia python=3.10 -y
+conda activate mia
 pip install -r requirements.txt
 ```
 
-### Dependencies
+### 1.2 依赖版本说明
 
-torch, transformers, pillow, tqdm, accelerate, qwen-vl-utils, matplotlib
+本仓库已与参考项目对齐共同依赖版本（例如 `torch==2.2.0`, `transformers==4.45.2`）。
 
-## Quick Start
+---
+
+## 2. 数据与模型准备
+
+## 2.1 下载 NIH bbox 数据到 `data/` 下
+
+已实现下载脚本：`data/download.py`。  
+默认会把可直接使用的数据复制到 `./data/3`（而不是只留在 kagglehub 缓存路径）。
 
 ```bash
-# 1. Extract bbox embeddings (class-specific prompts baked in)
-python scripts/extract_bbox_embeddings.py --model ./models/Qwen2-VL-2B-Instruct
-
-# 2. Train plain MLP
-python scripts/train_bbox_mlp.py --epochs 100 --lr 1e-3
-
-# 3. Train MLP with residual connections
-python scripts/train_bbox_mlp.py --epochs 100 --lr 1e-3 --use_residual
-
-# 4. Evaluate both variants
-python scripts/evaluate_bbox.py --model_path ./output/plain/bbox_mlp.pt
-python scripts/evaluate_bbox.py --model_path ./output/residual/bbox_mlp.pt
-
-# 5. Zero-shot + few-shot Qwen baselines
-python scripts/evaluate_few_shot.py --n_shot 0
-python scripts/evaluate_few_shot.py --n_shot 3
-
-# 6. Compare all 4 methods
-python scripts/compare_results.py
+python data/download.py --target_dir ./data/3
 ```
 
-### Mac-Specific Notes
+执行后应至少包含：
 
-- Uses `float16` on MPS (Apple Silicon) to reduce memory (~2-4GB for 2B/3B model)
-- If OOM, reduce `--batch_size` to 1 or 2
-- MLP training is extremely lightweight and runs on CPU/MPS
-
-## Architecture
-
-### Embedding Extraction
-
-Image + class-specific prompt → Qwen2-VL → mean-pool `last_hidden_state` → `(B, hidden_dim)` embedding. The prompt (e.g., "Describe lung collapse in this X-ray.") encodes class semantics into the embedding, so the downstream MLP doesn't need class labels as input.
-
-### BBox MLP - Plain
-
-```
-Linear(D→256) → ReLU → Dropout → Linear(256→128) → ReLU → Dropout → Linear(128→4)
+```text
+data/3/
+├── BBox_List_2017.csv
+├── images_001/
+│   └── images/*.png
+├── images_002/
+│   └── images/*.png
+└── ...
 ```
 
-### BBox MLP - Residual
+## 2.2 下载 Qwen2-VL-2B-Instruct
 
-```
-h = Linear(D→256)
-h = LayerNorm(h) → Linear(256→128) → ReLU → Dropout → Linear(128→256) + Linear(256→256)  # residual
-out = LayerNorm(h) → Linear(256→128) → ReLU → Dropout → Linear(128→4)
+```bash
+huggingface-cli download Qwen/Qwen2-VL-2B-Instruct --local-dir models/Qwen2-VL-2B-Instruct
 ```
 
-### Few-shot / Zero-shot Qwen
+---
 
-Direct text generation from Qwen2-VL. Zero-shot: class description prompt only. Few-shot: prompt includes 3 ground-truth bbox examples before the query image.
+## 3. 前置要求
 
-## Project Structure
+sbatch 脚本假设项目结构如下（数据下载和模型下载见 Section 2）：
 
-```
+```text
+PROJECT_DIR/
+├── data/3/                     ← NIH 数据（images_* + BBox_List_2017.csv）
+├── models/Qwen2-VL-2B-Instruct ← Qwen2-VL 模型
 ├── scripts/
-│   ├── extract_bbox_embeddings.py     # Extract bbox embeddings (3 classes)
-│   ├── train_bbox_mlp.py              # Train bbox MLP (plain + residual)
-│   ├── evaluate_bbox.py               # Evaluate bbox MLP + visualize
-│   ├── evaluate_few_shot.py           # Qwen zero/few-shot bbox baseline
-│   └── compare_results.py             # Compare all 4 methods → table
-├── output/
-│   ├── plain/                         # Plain MLP results
-│   │   ├── bbox_mlp.pt
-│   │   └── bbox_eval.json
-│   ├── residual/                      # Residual MLP results
-│   │   ├── bbox_mlp.pt
-│   │   └── bbox_eval.json
-│   ├── zero_shot_eval.json            # Qwen zero-shot bbox
-│   ├── few_shot_3_eval.json           # Qwen few-shot bbox (n=3)
-│   └── comparison.json                # All methods compared
-├── embeddings/                        # Pre-extracted Qwen embeddings
-├── requirements.txt
-└── README.md
+├── sbatch/
+└── ...
 ```
 
-## Key Script Arguments
+环境：脚本硬编码使用 `$HOME/.conda/envs/mia`，通过 `module load Anaconda3/2023.09-0` + `module load cuda12.2/toolkit/12.2.2` 加载系统 CUDA。
 
-| Argument | Description | Default |
-|---|---|---|
-| `--model` | Qwen model path | `./models/Qwen2-VL-2B-Instruct` |
-| `--device` | `auto`, `mps`, `cuda`, `cpu` | `auto` |
-| `--batch_size` | Images per batch | `4` |
-| `--epochs` | Training epochs | `100` |
-| `--lr` | Learning rate | `1e-3` |
-| `--use_residual` | Use residual connections | Off |
-| `--n_shot` | Number of few-shot examples | `0` |
+---
 
-## Why This Approach
+## 4. 数据划分逻辑（你问到的 split）
 
-Training a small MLP on frozen VLM embeddings is a **parameter-efficient** way to adapt large models to domain-specific tasks:
+本项目**不需要单独的 split 脚本文件**，因为在 embedding 提取阶段已经内置划分：
 
-- **No VLM fine-tuning needed** — Qwen stays frozen, only the MLP (a few hundred KB) is trained
-- **Fast iteration** — Embedding extraction is one-time; MLP training takes seconds
-- **Fair comparison** — Same embeddings, same test set, only the head differs (MLP vs prompt)
-- **Deployable** — The MLP checkpoint is tiny and can run independently once embeddings are computed
+- 代码位置：`scripts/extract_bbox_embeddings.py`
+- 划分函数：`scripts/utils/data_utils.py::stratified_patient_split`
+- 划分策略：按 `patient_id` 分层，默认 `train/val/test = 70/15/15`
+- 固定随机种子：`--seed`（默认 42）
 
-## License
+提取 embedding 时会同时写出：
 
-This project is for research and educational purposes.
+- `train.pt`
+- `val.pt`
+- `test.pt`
+- `meta.json`（含三个 split 的样本元信息）
+
+---
+
+## 5. 快速启动（命令行）
+
+## 5.1 提取 embeddings（两种 pooling）
+
+```bash
+python scripts/extract_bbox_embeddings.py \
+  --data_root "$DATA_ROOT" \
+  --bbox_csv "$BBOX_CSV" \
+  --model "$MODEL_PATH" \
+  --embedding_mode all_token_mean \
+  --max_per_class 2200 \
+  --device cuda \
+  --run_name emb_alltoken_manual
+
+python scripts/extract_bbox_embeddings.py \
+  --data_root "$DATA_ROOT" \
+  --bbox_csv "$BBOX_CSV" \
+  --model "$MODEL_PATH" \
+  --embedding_mode image_token_mean \
+  --max_per_class 2200 \
+  --device cuda \
+  --run_name emb_imagetoken_manual
+```
+
+## 5.2 训练 MLP
+
+```bash
+python scripts/train_bbox_mlp.py \
+  --embedding_dir ./embeddings/emb_alltoken_manual \
+  --arch residual \
+  --loss ciou \
+  --epochs 100 \
+  --batch_size 128 \
+  --device cuda \
+  --run_name train_residual_ciou_manual
+```
+
+## 5.3 评估 MLP
+
+```bash
+python scripts/evaluate_bbox.py \
+  --model_path ./output/train/train_residual_ciou_manual/bbox_mlp.pt \
+  --embedding_dir ./embeddings/emb_alltoken_manual \
+  --device cuda \
+  --run_name eval_residual_ciou_manual
+```
+
+## 5.4 评估 zero/few-shot baseline
+
+```bash
+python scripts/evaluate_few_shot.py \
+  --embedding_dir ./embeddings/emb_alltoken_manual \
+  --model "$MODEL_PATH" \
+  --n_shot 0 \
+  --device cuda \
+  --run_name vlm_zero_shot_manual
+
+python scripts/evaluate_few_shot.py \
+  --embedding_dir ./embeddings/emb_alltoken_manual \
+  --model "$MODEL_PATH" \
+  --n_shot 3 \
+  --device cuda \
+  --run_name vlm_few_shot3_manual
+```
+
+---
+
+## 6. Slurm/H800 实验流程
+
+### 6.1 提取 Embedding
+
+```bash
+# 一次性提取两种 pooling（all_token + image_token）
+sbatch sbatch/run_extract_embeddings.sbatch
+
+# 或单独提取
+sbatch sbatch/extract_embeddings_alltoken.sbatch
+sbatch sbatch/extract_embeddings_imagetoken.sbatch
+```
+
+输出路径：`embeddings/emb_alltoken/` 和 `embeddings/emb_imagetoken/`
+
+### 6.2 训练 MLP（一键跑完所有配置）
+
+一次性跑完 12 种配置（2 embedding × 2 arch × 3 loss）：
+
+```bash
+sbatch sbatch/train_mlp_all.sbatch
+```
+
+配置列表：
+
+| Embedding | Arch | Loss |
+|-----------|------|------|
+| alltoken / imagetoken | residual / plain | ciou / smoothl1 / iou |
+
+输出：`output/train/train_<arch>_<loss>_<embedding>/`
+
+### 6.3 评估 MLP（一键评估所有配置）
+
+训练完成后一键评估所有 12 个模型：
+
+```bash
+sbatch sbatch/eval_mlp_all.sbatch
+```
+
+### 6.4 评估 VLM Baseline（Zero-shot + Few-shot）
+
+```bash
+# 同时运行 zero-shot 和 few-shot (n=3)
+sbatch sbatch/run_eval_vlm_baselines.sbatch
+
+# 或单独运行
+sbatch sbatch/eval_vlm_zeroshot.sbatch
+sbatch sbatch/eval_vlm_fewshot3.sbatch
+```
+
+> 默认使用 `embeddings/emb_alltoken`（已提取的 embedding）。如需更换，运行时覆盖 `EMBEDDING_DIR` 环境变量。
+
+---
+
+## 7. 输出目录
+
+```text
+embeddings/emb_alltoken/
+  train.pt / val.pt / test.pt / meta.json / config.json / split_stats.json
+
+embeddings/emb_imagetoken/
+  train.pt / val.pt / test.pt / meta.json / config.json / split_stats.json
+
+output/train/train_<arch>_<loss>_<embedding>/
+  bbox_mlp.pt / train_result.json
+
+output/eval/eval_<arch>_<loss>_<embedding>/
+  bbox_eval.json
+
+output/vlm/
+  vlm_zeroshot / vlm_fewshot3
+```
+
+---
+
+## 8. 详细实现文档
+
+- `project_implementation_details.md`
+- `sbatch/README.md`

@@ -7,6 +7,16 @@ data/nih-chest-xrays/
 
 # Outputs
 # output/
+output/*
+!output/.gitkeep
+
+# Embedding runs
+embeddings/*
+!embeddings/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
 
 # Python
 __pycache__/
